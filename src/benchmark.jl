@@ -69,6 +69,41 @@ function hepmc3gunzip(input_file::AbstractString)
     unpacked_file
 end
 
+function ipmi_command()
+    output = read(`ipmitool dcmi power reading`, String)
+    t = time_ns()
+    s = tryparse(Float64, match(r"Instantaneous power reading:\s+([\d\.]+) Watts", output)[1])
+    (s, t)
+end
+
+function ipmi_chan(nsamples:Integer)
+    Channel{Float64}(spawn=true) do ch 
+        sample_time = [(0.0,0.0), (0.0,0.0)] 
+        idx = 1
+        energy_nj = 0.0
+
+        rdy = function rdy()
+            isready(ch)
+        end
+        
+        for irun in 1:nsamples
+            take!(ch) #block until we tell it to start
+            sample_time[idx] = ipmi_command()
+            idx = 3 - idx #toggle 1 and 2
+            while !rdy()
+                    timedwait(rdy, 2) #sample every 2 seconds or until we're told to stop
+                    sample_time[idx] = ipmi_command()
+                    idx = 3 - idx
+                    #trapezium rule
+                    energy_nj += (sample_time[1][1]+sample_time[2][1])*abs(sample_time[2][1]-sample_time[2][2])/2.0
+            end
+            take!(ch) #take the value passed to us to stop our counter 
+            put!(energy_nj * 1.e-9 ) #Joules
+            energy_nj = 0.0
+        end
+    end    
+end
+    
 function julia_jet_process_avg_time(events::Vector{Vector{T}};
     ptmin::Float64 = 5.0,
     radius::Float64 = 0.4,
@@ -76,15 +111,16 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     algorithm::JetAlgorithm.Algorithm = JetAlgorithm.AntiKt,
     strategy::RecoStrategy.Strategy,
     nsamples::Integer = 1,
-    repeats::Int = 1) where {T <: JetReconstruction.FourMomentum}
+    repeats::Int = 1, 
+    ipmi::Bool = false ) where {T <: JetReconstruction.FourMomentum}
     @info "Will process $(size(events)[1]) events, repeating $(repeats) time(s)"
-    
+
     # Set consistent algorithm and power
     (p, algorithm) = JetReconstruction.get_algorithm_power_consistency(p = p,
     algorithm = algorithm)
     
     n_events = length(events)
-    
+        
     # Warmup code if we are doing a multi-sample timing run
     if nsamples > 1
         @info "Doing initial warm-up run"
@@ -96,33 +132,61 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     
     # Threading?
     threads = Threads.nthreads()
-    if threads > 1
-        @info "Will use $threads threads"
+    if (threads < 2) && ipmi 
+        @error "Need at least 2 threads to perform parallel ipmi measurements of power"
+        return 0.0
     end
     
     # Now setup timers and run the loop
     cummulative_time = 0.0
     cummulative_time2 = 0.0
+    lowest_energy = 0.0
+    nrg = 0.0
     lowest_time = typemax(Float64)
     finaljets = Vector{Vector{PseudoJet}}(undef, threads)
     fj = Vector{Vector{FinalJet}}(undef, threads)
     
+    if ipmi
+        ipmi_ch = ipmi_chan(nsamples) 
+    end
+    
     for irun in 1:nsamples
+        
+        if ipmi    
+            put!(ipmi_ch,0.0)
+        end
+        
         t_start = time_ns()
-        Threads.@threads for event_counter ∈ 1:n_events * repeats
+        #this was threaded in Graeme's version but can't be now because we want to do parallel ipmi measurement
+        for event_counter ∈ 1:n_events * repeats
             event_idx = mod1(event_counter, n_events)
             my_t = Threads.threadid()
             inclusive_jets(jet_reconstruct(events[event_idx], R = radius, p = p,
             strategy = strategy), ptmin = ptmin)
         end
+
+        if ipmi
+            put!(ipmi_ch,0.0)
+        end
+        
         t_stop = time_ns()
+
+        if ipmi
+            nrg = take!(ipmi_ch)
+        end
+        
         dt_μs = convert(Float64, t_stop - t_start) * 1.e-3
         if nsamples > 1
             @info "$(irun)/$(nsamples) $(dt_μs)"
         end
         cummulative_time += dt_μs
         cummulative_time2 += dt_μs^2
-        lowest_time = dt_μs < lowest_time ? dt_μs : lowest_time
+        if dt_μs < lowest_time
+            lowest_time = dt_μs
+            if ipmi
+                lowest_energy = nrg
+            end
+        end
     end
     
     mean = cummulative_time / nsamples
@@ -142,7 +206,7 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     # adds jitter, depending on the other things the machine is doing. Therefore
     # the minimum value is (a) more stable and (b) reflects better the intrinsic
     # code performance.
-    lowest_time
+    (lowest_time, lowest_energy)
 end
 
 function fastjet_jet_process_avg_time(input_file::AbstractString;
@@ -151,7 +215,14 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
     p::Union{Real, Nothing} = nothing,
     algorithm::JetAlgorithm.Algorithm = JetAlgorithm.AntiKt,
     strategy::RecoStrategy.Strategy,
-    nsamples::Integer = 1)
+    nsamples::Integer = 1,
+    repeats::Integer = 1, #added to keep positional ordering same
+    ipmi::Bool = false )
+
+    if ipmi && (nsamples > 1)
+        @error "Cannot perform ipmi power sampling for multiple samples for fastjet"
+        return 0.0
+    end
     
     # FastJet reader cannot handle gzipped files
     if endswith(input_file, ".gz")
@@ -188,7 +259,14 @@ function python_jet_process_avg_time(backend::Backends.Code,
     p::Union{Real, Nothing} = nothing,
     algorithm::JetAlgorithm.Algorithm = JetAlgorithm.AntiKt,
     strategy::RecoStrategy.Strategy,
-    nsamples::Integer = 1)
+    nsamples::Integer = 1,
+    repeats::Integer = 1, #added to keep positional ordering same
+    ipmi::Bool = false )
+
+    if ipmi && (nsamples > 1)
+        @error "Cannot perform ipmi power sampling for multiple samples for python"
+        return 0.0
+    end
     
     # Python reader cannot handle gzipped files
     if endswith(input_file, ".gz")
