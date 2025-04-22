@@ -249,8 +249,8 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
         put!(ipmi_ch, 0.0)
     end 
     fj_output = read(`$fj_bin $fj_args $input_file`, String)
-    put!(ipmi_ch, 0.0)
-    energy = take!(ipmi_ch)
+    ipmi ? put!(ipmi_ch, 0.0) : 0.0 
+    energy = ipmi ? take!(ipmi_ch) : 0.0
     
     min = tryparse(Float64, match(r"Lowest time per event ([\d\.]+) us", fj_output)[1])
     if isnothing(min)
@@ -328,8 +328,8 @@ function python_jet_process_avg_time(backend::Backends.Code,
     end 
 
     py_output = read(`$py_script $py_args $input_file`, String)
-    put!(ipmi_ch, 0.0)
-    energy = take!(ipmi_ch)
+    ipmi ? put!(ipmi_ch, 0.0) : 0.0
+    energy = ipmi ? take!(ipmi_ch) : 0.0
     
     min = tryparse(Float64, match(r"Minimum time per event ([\d\.]+) us", py_output)[1])
     if isnothing(min)
