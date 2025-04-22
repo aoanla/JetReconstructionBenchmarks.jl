@@ -82,10 +82,8 @@ function ipmi_chan(nsamples:Integer)
         idx = 1
         energy_nj = 0.0
 
-        rdy = function rdy()
-            isready(ch)
-        end
-        
+        rdy() = (isready(ch))
+    
         for irun in 1:nsamples
             take!(ch) #block until we tell it to start
             sample_time[idx] = ipmi_command()
@@ -120,7 +118,8 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     algorithm = algorithm)
     
     n_events = length(events)
-        
+    ipmi_ch = nothing 
+    
     # Warmup code if we are doing a multi-sample timing run
     if nsamples > 1
         @info "Doing initial warm-up run"
@@ -243,13 +242,22 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
     
     push!(fj_args, "-n", string(nsamples))
     @info "Fastjet command: $fj_bin $fj_args $input_file"
+    
+    ipmi_ch = nothing
+    if ipmi
+        ipmi_ch = ipmi_chan(nsamples) 
+        put!(ipmi_ch, 0.0)
+    end 
     fj_output = read(`$fj_bin $fj_args $input_file`, String)
+    put!(ipmi_ch, 0.0)
+    energy = take!(ipmi_ch)
+    
     min = tryparse(Float64, match(r"Lowest time per event ([\d\.]+) us", fj_output)[1])
     if isnothing(min)
         @error "Failed to parse output from FastJet script"
-        return 0.0
+        return (0.0,0.0)
     end
-    min
+    (min, energy)
 end
 
 function python_jet_process_avg_time(backend::Backends.Code,
@@ -312,13 +320,23 @@ function python_jet_process_avg_time(backend::Backends.Code,
     
     push!(py_args, "--trials", string(nsamples))
     @info "Python command: $py_script $py_args $input_file"
+
+    ipmi_ch = nothing
+    if ipmi
+        ipmi_ch = ipmi_chan(nsamples) 
+        put!(ipmi_ch, 0.0)
+    end 
+
     py_output = read(`$py_script $py_args $input_file`, String)
+    put!(ipmi_ch, 0.0)
+    energy = take!(ipmi_ch)
+    
     min = tryparse(Float64, match(r"Minimum time per event ([\d\.]+) us", py_output)[1])
     if isnothing(min)
         @error "Failed to parse output from Python script"
-        return 0.0
+        return (0.0,0.0)
     end
-    min
+    (min, energy)
 end
 
 function parse_command_line(args)
