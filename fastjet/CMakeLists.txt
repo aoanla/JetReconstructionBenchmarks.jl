@@ -10,7 +10,7 @@ project(FastJetBenchmarks)
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake;${CMAKE_MODULE_PATH}")
 
 find_package(HepMC3 REQUIRED)
-find_package(FastJet REQUIRED)
+# find_package(FastJet REQUIRED)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -22,10 +22,10 @@ add_executable(fastjet-finder
 )
 
 target_include_directories(fastjet-finder PRIVATE
-    ${FASTJET_INCLUDE_DIRS}
+    ../../fastjet-install/include
 )
 
 target_link_libraries(fastjet-finder 
     HepMC3::HepMC3
-    ${FASTJET_LIBRARIES}
+    ../../fastjet-install/lib/libfastjet.so
 )
