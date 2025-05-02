@@ -226,7 +226,7 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     # adds jitter, depending on the other things the machine is doing. Therefore
     # the minimum value is (a) more stable and (b) reflects better the intrinsic
     # code performance.
-    (lowest_time, mean_impi_energy/cummulative_time, mean_rapl_energy/cummulative_time)
+    (lowest_time, impi_nrg/cummulative_time, rapl_nrg/cummulative_time)
 end
 
 function fastjet_jet_process_avg_time(input_file::AbstractString;
