@@ -97,7 +97,7 @@ function max_ratp_read()
 	parse(Float64,read(f, String))
 end
 
-function ipmi_chan(nsamples:Integer)
+function ipmi_chan(nsamples::Integer)
     Channel{Float64}(spawn=true) do ch 
         ipmi_time = [(0.0,0.0), (0.0,0.0)] 
 	ratp_sample = [0.0,0.0]
