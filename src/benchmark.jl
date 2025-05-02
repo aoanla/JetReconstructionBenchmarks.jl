@@ -119,7 +119,7 @@ function ipmi_chan(nsamples::Integer)
  		    ratp_sample[idx],loops = ratp_read(ratp_sample[3-idx],loops)  #need to compare to previous to discover discontinuities when it overflows
                     idx = 3 - idx
                     #trapezium rule
-                    energy_uj += (ipmi_time[1][2]+ipmi_time[2][2])*abs(ipmi_time[2][1]-ipmi_time[1][1])/2.0
+                    energy_uj += (ipmi_time[1][1]+ipmi_time[2][1])*abs(ipmi_time[2][2]-ipmi_time[1][2])/2.0
             end
             take!(ch) #take the value passed to us to stop our counter 
 		#the function we pass to uses us as its timescale, so if we pass uj then uj/us = W, which is what we want
