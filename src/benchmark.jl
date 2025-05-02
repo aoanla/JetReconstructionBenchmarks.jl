@@ -71,7 +71,7 @@ end
 
 function ipmi_command()
     output = read(`sudo ipmitool dcmi power reading`, String)
-    t = time_ns()
+    t = Int64(time_ns())
     s = tryparse(Float64, match(r"Instantaneous power reading:\s+([\d\.]+) Watts", output)[1])
     (s, t)
 end
@@ -85,6 +85,7 @@ function ratp_read(prev_v, loops)
 		new_v = tryparse(Float64,read(f, String))
 		if new_v < prev_v
 			loops += 1
+		end
 	end
 	(new_v, loops)
 end
@@ -118,12 +119,12 @@ function ipmi_chan(nsamples:Integer)
  		    ratp_sample[idx],loops = ratp_read(ratp_sample[3-idx],loops)  #need to compare to previous to discover discontinuities when it overflows
                     idx = 3 - idx
                     #trapezium rule
-                    energy_uj += (ipmi_time[1][1]+ipmi_time[2][1])*abs(ipmi_time[2][1]-ipmi_time[2][2])/2.0
+                    energy_uj += (ipmi_time[1][2]+ipmi_time[2][2])*abs(ipmi_time[2][1]-ipmi_time[1][1])/2.0
             end
             take!(ch) #take the value passed to us to stop our counter 
 		#the function we pass to uses us as its timescale, so if we pass uj then uj/us = W, which is what we want
-            put!(energy_uj * 1.e-3 ) #uJoules from nj
-            put!( (ratp_sample[3-idx] + max_ratp*loops - sample_energy) ) #uj from uj 
+            put!(ch, energy_uj * 1.e-3 ) #uJoules from nj
+            put!(ch, (ratp_sample[3-idx] + max_ratp*loops - sample_energy) ) #uj from uj 
             energy_uj = 0.0
         end
     end    
