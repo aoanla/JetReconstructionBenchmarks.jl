@@ -70,34 +70,61 @@ function hepmc3gunzip(input_file::AbstractString)
 end
 
 function ipmi_command()
-    output = read(`ipmitool dcmi power reading`, String)
+    output = read(`sudo ipmitool dcmi power reading`, String)
     t = time_ns()
     s = tryparse(Float64, match(r"Instantaneous power reading:\s+([\d\.]+) Watts", output)[1])
     (s, t)
 end
 
+#returns power in uj at current sample time, detecting "loops" since the last measurement by incrementing the loops variable
+#you must sample ratp sufficiently frequently that only 1 loop happens per sample period [probably > 0.05Hz]
+#(power, loops)  - you will need to calculate total power by multiplying loops by max_ratp_read() and adding to the power
+function ratp_read(prev_v, loops)
+	new_v = 0.0
+	open("/sys/class/powercap/intel-rapl:0/energy_uj", "r") do f
+		new_v = tryparse(Float64,read(f, String))
+		if new_v < prev_v
+			loops += 1
+	end
+	(new_v, loops)
+end
+
+#maximum power range (the value at which ratp_read loops) in uj
+#total power from a ratp_read sampled sufficiently often is power*max_ratp_read*loops [see ratp_read]
+function max_ratp_read()
+	f = open("/sys/class/powercap/intel-rapl:0/max_energy_range_uj", "r") 
+	parse(Float64,read(f, String))
+end
+
 function ipmi_chan(nsamples:Integer)
     Channel{Float64}(spawn=true) do ch 
-        sample_time = [(0.0,0.0), (0.0,0.0)] 
+        ipmi_time = [(0.0,0.0), (0.0,0.0)] 
+	ratp_sample = [0.0,0.0]
+        max_ratp = max_ratp_read()
         idx = 1
-        energy_nj = 0.0
+        energy_uj = 0.0
 
         rdy() = (isready(ch))
     
         for irun in 1:nsamples
             take!(ch) #block until we tell it to start
-            sample_time[idx] = ipmi_command()
+            ipmi_time[idx] = ipmi_command()
+	    sample_energy, loops = ratp_read(0, 0)
+	    ratp_sample[idx] = sample_energy
             idx = 3 - idx #toggle 1 and 2
             while !rdy()
-                    timedwait(rdy, 2) #sample every 2 seconds or until we're told to stop
-                    sample_time[idx] = ipmi_command()
+                    timedwait(rdy, 5) #sample every 5 seconds or until we're told to stop
+                    ipmi_time[idx] = ipmi_command()
+ 		    ratp_sample[idx],loops = ratp_read(ratp_sample[3-idx],loops)  #need to compare to previous to discover discontinuities when it overflows
                     idx = 3 - idx
                     #trapezium rule
-                    energy_nj += (sample_time[1][1]+sample_time[2][1])*abs(sample_time[2][1]-sample_time[2][2])/2.0
+                    energy_uj += (ipmi_time[1][1]+ipmi_time[2][1])*abs(ipmi_time[2][1]-ipmi_time[2][2])/2.0
             end
             take!(ch) #take the value passed to us to stop our counter 
-            put!(energy_nj * 1.e-9 ) #Joules
-            energy_nj = 0.0
+		#the function we pass to uses us as its timescale, so if we pass uj then uj/us = W, which is what we want
+            put!(energy_uj * 1.e-3 ) #uJoules from nj
+            put!( (ratp_sample[3-idx] + max_ratp*loops - sample_energy) ) #uj from uj 
+            energy_uj = 0.0
         end
     end    
 end
@@ -140,20 +167,18 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     cummulative_time = 0.0
     cummulative_time2 = 0.0
     lowest_energy = 0.0
-    nrg = 0.0
+    ipmi_nrg = missing
+    rapl_nrg = missing
     lowest_time = typemax(Float64)
     finaljets = Vector{Vector{PseudoJet}}(undef, threads)
     fj = Vector{Vector{FinalJet}}(undef, threads)
     
     if ipmi
-        ipmi_ch = ipmi_chan(nsamples) 
+        ipmi_ch = ipmi_chan(1)
+	put!(ipmi_ch,0.0) 
     end
     
     for irun in 1:nsamples
-        
-        if ipmi    
-            put!(ipmi_ch,0.0)
-        end
         
         t_start = time_ns()
         #this was threaded in Graeme's version but can't be now because we want to do parallel ipmi measurement
@@ -164,16 +189,8 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
             strategy = strategy), ptmin = ptmin)
         end
 
-        if ipmi
-            put!(ipmi_ch,0.0)
-        end
-        
         t_stop = time_ns()
 
-        if ipmi
-            nrg = take!(ipmi_ch)
-        end
-        
         dt_μs = convert(Float64, t_stop - t_start) * 1.e-3
         if nsamples > 1
             @info "$(irun)/$(nsamples) $(dt_μs)"
@@ -182,10 +199,13 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
         cummulative_time2 += dt_μs^2
         if dt_μs < lowest_time
             lowest_time = dt_μs
-            if ipmi
-                lowest_energy = nrg
-            end
         end
+    end
+
+    if ipmi
+	put!(ipmi_ch, 0.0)
+	ipmi_nrg = take!(ipmi_ch)
+        rapl_nrg = take!(ipmi_ch)
     end
     
     mean = cummulative_time / nsamples
@@ -205,7 +225,7 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     # adds jitter, depending on the other things the machine is doing. Therefore
     # the minimum value is (a) more stable and (b) reflects better the intrinsic
     # code performance.
-    (lowest_time, lowest_energy)
+    (lowest_time, mean_impi_energy/cummulative_time, mean_rapl_energy/cummulative_time)
 end
 
 function fastjet_jet_process_avg_time(input_file::AbstractString;
@@ -218,10 +238,6 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
     repeats::Integer = 1, #added to keep positional ordering same
     ipmi::Bool = false )
 
-    if ipmi && (nsamples > 1)
-        @error "Cannot perform ipmi power sampling for multiple samples for fastjet"
-        return 0.0
-    end
     
     # FastJet reader cannot handle gzipped files
     if endswith(input_file, ".gz")
@@ -243,21 +259,34 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
     push!(fj_args, "-n", string(nsamples))
     @info "Fastjet command: $fj_bin $fj_args $input_file"
     
+    t_start = UInt64(0)
+    t_us = missing
+    ipmi_nrg = 0.0
+    ratp_nrg = 0.0
+
     ipmi_ch = nothing
     if ipmi
-        ipmi_ch = ipmi_chan(nsamples) 
+        t_start = time_ns()
+        ipmi_ch = ipmi_chan(1) 
         put!(ipmi_ch, 0.0)
-    end 
+    end
+ 
     fj_output = read(`$fj_bin $fj_args $input_file`, String)
-    ipmi ? put!(ipmi_ch, 0.0) : 0.0 
-    energy = ipmi ? take!(ipmi_ch) : 0.0
-    
+
+    if ipmi
+	put!(ipmi_ch, 0.0) 
+    	t_end = time_ns()
+        t_us = (t_end - t_start) * 1e-3
+    	ipmi_nrg = take!(ipmi_ch) 
+    	ratp_nrg = take!(ipmi_ch)     
+    end
+
     min = tryparse(Float64, match(r"Lowest time per event ([\d\.]+) us", fj_output)[1])
     if isnothing(min)
         @error "Failed to parse output from FastJet script"
-        return (0.0,0.0)
+        return (0.0,0.0,0.0)
     end
-    (min, energy)
+    (min, ipmi_nrg / t_us, ratp_nrg / t_us)
 end
 
 function python_jet_process_avg_time(backend::Backends.Code,
@@ -271,10 +300,6 @@ function python_jet_process_avg_time(backend::Backends.Code,
     repeats::Integer = 1, #added to keep positional ordering same
     ipmi::Bool = false )
 
-    if ipmi && (nsamples > 1)
-        @error "Cannot perform ipmi power sampling for multiple samples for python"
-        return 0.0
-    end
     
     # Python reader cannot handle gzipped files
     if endswith(input_file, ".gz")
@@ -321,22 +346,36 @@ function python_jet_process_avg_time(backend::Backends.Code,
     push!(py_args, "--trials", string(nsamples))
     @info "Python command: $py_script $py_args $input_file"
 
+    t_start = UInt64(0)
+    t_us = missing
+    ipmi_nrg = 0.0
+    ratp_nrg = 0.0
+
     ipmi_ch = nothing
     if ipmi
-        ipmi_ch = ipmi_chan(nsamples) 
+        t_start = time_ns()
+        ipmi_ch = ipmi_chan(1) 
         put!(ipmi_ch, 0.0)
-    end 
-
+    end
+ 
     py_output = read(`$py_script $py_args $input_file`, String)
-    ipmi ? put!(ipmi_ch, 0.0) : 0.0
-    energy = ipmi ? take!(ipmi_ch) : 0.0
-    
+   
+
+    if ipmi
+	put!(ipmi_ch, 0.0)
+    	t_end = time_ns()
+        t_us = (t_end - t_start) * 1e-3
+    	ipmi_nrg = take!(ipmi_ch) 
+    	ratp_nrg = take!(ipmi_ch)     
+    end
+
+ 
     min = tryparse(Float64, match(r"Minimum time per event ([\d\.]+) us", py_output)[1])
     if isnothing(min)
         @error "Failed to parse output from Python script"
         return (0.0,0.0)
     end
-    (min, energy)
+    (min, ipmi_nrg/t_us, ratp_nrg/t_us)
 end
 
 function parse_command_line(args)
@@ -409,6 +448,10 @@ function parse_command_line(args)
     "--results"
     help = """Write results in CSV format to this directory/file. If a directory is given, a file named 'BACKEND-ALGORITHM-STRATEGY-RADIUS.csv' will be created."""
     
+    "--ipmi"
+    help = "Attempt to measure power from IPMI (system) and RATP (CPU)"
+    action = :store_true
+
     "files"
     help = "HepMC3 event files in to process or CSV file listing event files"
     required = true
@@ -451,6 +494,9 @@ function main()
     (power, algorithm) = JetReconstruction.get_algorithm_power_consistency(p = args[:power], algorithm = args[:algorithm])
     
     event_timing = Float64[]
+    ipmi_powering = Union{Missing,Float64}[]
+    ratp_powering = Union{Missing,Float64}[]
+
     n_samples = Int[]
     for event_file in hepmc3_files_df[:, :File_path]
         if event_file in args[:nsamples_override]
@@ -469,33 +515,37 @@ function main()
                 JetType = PseudoJet
             end
             events::Vector{Vector{JetType}} = read_final_state_particles(event_file; T = JetType)
-            time_per_event = julia_jet_process_avg_time(events; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power = julia_jet_process_avg_time(events; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
             strategy = args[:strategy],
-            nsamples = samples, repeats = args[:repeats])
+            nsamples = samples, repeats = args[:repeats], ipmi=args[:ipmi])
         elseif args[:code] == Backends.Fastjet
-            time_per_event = fastjet_jet_process_avg_time(event_file; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power = fastjet_jet_process_avg_time(event_file; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
             strategy = args[:strategy],
-            nsamples = samples)
+            nsamples = samples, ipmi=args[:ipmi])
         elseif args[:code] in (Backends.AkTPython, Backends.AkTNumPy)
-            time_per_event = python_jet_process_avg_time(args[:code], event_file; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power = python_jet_process_avg_time(args[:code], event_file; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
             strategy = args[:strategy],
-            nsamples = samples)
+            nsamples = samples, ipmi=args[:ipmi])
         end
         
         push!(event_timing, time_per_event)
+        push!(ipmi_powering, ipmi_power)
+        push!(ratp_powering, ratp_power)
     end
     # Add results to the DataFrame
     hepmc3_files_df[:, :n_samples] = n_samples
     hepmc3_files_df[:, :time_per_event] = event_timing
+    hepmc3_files_df[:, :ipmi_power] = ipmi_powering
+    hepmcs_files_df[:, :ratp_power] = ratp_powering
 
     # Decorate the DataFrame with the metadata of the runs
     hepmc3_files_df[:, :code] .= args[:code]
