@@ -173,19 +173,15 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     lowest_time = typemax(Float64)
     finaljets = Vector{Vector{PseudoJet}}(undef, threads)
     fj = Vector{Vector{FinalJet}}(undef, threads)
-    
-    if ipmi
-        ipmi_ch = ipmi_chan(1)
-	put!(ipmi_ch,0.0) 
-    end
-    
-    for irun in 1:nsamples
+
+    juliabench() = begin 
+	for irun in 1:nsamples
         
         t_start = time_ns()
         #this was threaded in Graeme's version but can't be now because we want to do parallel ipmi measurement
         for event_counter ∈ 1:n_events * repeats
             event_idx = mod1(event_counter, n_events)
-            my_t = Threads.threadid()
+           # my_t = Threads.threadid()
             inclusive_jets(jet_reconstruct(events[event_idx], R = radius, p = p,
             strategy = strategy), ptmin = ptmin)
         end
@@ -202,6 +198,20 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
             lowest_time = dt_μs
         end
     end
+    (cummulative_time, lowest_time)
+    end
+  
+    t_j = Task(juliabench)
+    t_j.sticky = false
+  
+    if ipmi     #this needs a separate thread for the benchmarked process too - which we achieve via the above task 
+        ipmi_ch = ipmi_chan(1)
+	put!(ipmi_ch,0.0) 
+    end
+    
+    schedule(t_j)    #doing this fixes things for the *first* benchmark only...[and even then it might not, the numbers are still weird]
+    cummulative_time, lowest_time = fetch(t_j)
+
 
     if ipmi
 	put!(ipmi_ch, 0.0)
@@ -209,15 +219,6 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
         rapl_nrg = take!(ipmi_ch)
     end
     
-    mean = cummulative_time / nsamples
-    cummulative_time2 /= nsamples
-    if nsamples > 1
-        sigma = sqrt(nsamples / (nsamples - 1) * (cummulative_time2 - mean^2))
-    else
-        sigma = 0.0
-    end
-    mean /= n_events * repeats
-    sigma /= n_events * repeats
     lowest_time /= n_events * repeats
     # Why also record the lowest time? 
     # 
@@ -226,7 +227,7 @@ function julia_jet_process_avg_time(events::Vector{Vector{T}};
     # adds jitter, depending on the other things the machine is doing. Therefore
     # the minimum value is (a) more stable and (b) reflects better the intrinsic
     # code performance.
-    (lowest_time, impi_nrg/cummulative_time, rapl_nrg/cummulative_time)
+    (lowest_time, ipmi_nrg/cummulative_time, rapl_nrg/cummulative_time, cummulative_time)
 end
 
 function fastjet_jet_process_avg_time(input_file::AbstractString;
@@ -287,7 +288,7 @@ function fastjet_jet_process_avg_time(input_file::AbstractString;
         @error "Failed to parse output from FastJet script"
         return (0.0,0.0,0.0)
     end
-    (min, ipmi_nrg / t_us, ratp_nrg / t_us)
+    (min, ipmi_nrg / t_us, ratp_nrg / t_us, t_us)
 end
 
 function python_jet_process_avg_time(backend::Backends.Code,
@@ -376,7 +377,7 @@ function python_jet_process_avg_time(backend::Backends.Code,
         @error "Failed to parse output from Python script"
         return (0.0,0.0)
     end
-    (min, ipmi_nrg/t_us, ratp_nrg/t_us)
+    (min, ipmi_nrg/t_us, ratp_nrg/t_us, t_us)
 end
 
 function parse_command_line(args)
@@ -497,6 +498,7 @@ function main()
     event_timing = Float64[]
     ipmi_powering = Union{Missing,Float64}[]
     ratp_powering = Union{Missing,Float64}[]
+    timeing = Float64[]
 
     n_samples = Int[]
     for event_file in hepmc3_files_df[:, :File_path]
@@ -516,21 +518,21 @@ function main()
                 JetType = PseudoJet
             end
             events::Vector{Vector{JetType}} = read_final_state_particles(event_file; T = JetType)
-            time_per_event,ipmi_power,ratp_power = julia_jet_process_avg_time(events; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power,time_tot = julia_jet_process_avg_time(events; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
             strategy = args[:strategy],
             nsamples = samples, repeats = args[:repeats], ipmi=args[:ipmi])
         elseif args[:code] == Backends.Fastjet
-            time_per_event,ipmi_power,ratp_power = fastjet_jet_process_avg_time(event_file; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power,time_tot = fastjet_jet_process_avg_time(event_file; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
             strategy = args[:strategy],
             nsamples = samples, ipmi=args[:ipmi])
         elseif args[:code] in (Backends.AkTPython, Backends.AkTNumPy)
-            time_per_event,ipmi_power,ratp_power = python_jet_process_avg_time(args[:code], event_file; ptmin = args[:ptmin],
+            time_per_event,ipmi_power,ratp_power,time_tot = python_jet_process_avg_time(args[:code], event_file; ptmin = args[:ptmin],
             radius = args[:radius],
             algorithm = args[:algorithm],
             p = args[:power],
@@ -541,12 +543,15 @@ function main()
         push!(event_timing, time_per_event)
         push!(ipmi_powering, ipmi_power)
         push!(ratp_powering, ratp_power)
+        push!(timeing, time_tot)
     end
     # Add results to the DataFrame
     hepmc3_files_df[:, :n_samples] = n_samples
     hepmc3_files_df[:, :time_per_event] = event_timing
     hepmc3_files_df[:, :ipmi_power] = ipmi_powering
-    hepmcs_files_df[:, :ratp_power] = ratp_powering
+    hepmc3_files_df[:, :ratp_power] = ratp_powering
+    hepmc3_files_df[:, :total_time] = timeing
+
 
     # Decorate the DataFrame with the metadata of the runs
     hepmc3_files_df[:, :code] .= args[:code]
